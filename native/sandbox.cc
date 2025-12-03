@@ -1,11 +1,8 @@
 #include <string>
-#include <iostream>
-#include <functional>
 #include <system_error>
 #include <vector>
 #include <stdexcept>
 #include <memory>
-#include <mutex>
 
 #include <cstring>
 #include <cassert>
@@ -27,13 +24,15 @@
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
-#include <fmt/std.h>
+#include <fmt/os.h>
 
 #include "sandbox.h"
 #include "utils.h"
 #include "cgroup.h"
 #include "semaphore.h"
 #include "pipe.h"
+
+#include <iostream>
 
 namespace fs = std::filesystem;
 using std::string;
@@ -117,6 +116,9 @@ struct ExecutionParameter
     // This pipe is used to forward error message from the child process to the parent.
     PosixPipe pipefd;
 
+    // Baseline stats captured just before exec
+    int64_t baselineCpuUsageUs = 0;
+
     ExecutionParameter(const SandboxParameter &param, int pipeOptions) : parameter(param),
                                                                          semaphore1(true, 0),
                                                                          semaphore2(true, 0),
@@ -139,23 +141,28 @@ static void EnsureDirectoryExistance(fs::path dir) {
 void GetUserEntryInSandbox(const fs::path &rootfs, const std::string username, std::vector<char> &dataBuffer, passwd &entry) {
     auto passwdFilePath = rootfs / "etc" / "passwd";
     std::unique_ptr<FILE, decltype(&fclose)> passwdFile(fopen(passwdFilePath.c_str(), "r"), &fclose);
-    if (passwdFile == nullptr)
+    if (passwdFile == nullptr) {
         throw std::system_error(errno, std::system_category(), "Couldn't open /etc/passwd in rootfs");
+    }
 
     long passwdBufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
-    if (passwdBufferSize == -1) passwdBufferSize = 16384;
+    if (passwdBufferSize == -1) { passwdBufferSize = 16384; }
     dataBuffer.resize(passwdBufferSize);
 
     passwd *user = nullptr;
-    while (fgetpwent_r(passwdFile.get(), &entry, dataBuffer.data(), passwdBufferSize, &user) == 0)
-        if (username == user->pw_name)
+    while (fgetpwent_r(passwdFile.get(), &entry, dataBuffer.data(), passwdBufferSize, &user) == 0) {
+        if (username == user->pw_name) {
             break;
+        }
+    }
 
-    if (user == nullptr)
-        if (errno == ENOENT)
+    if (user == nullptr) {
+        if (errno == ENOENT) {
             throw std::invalid_argument(format("No such user: {}", username));
-        else
+        } else {
             throw std::system_error(errno, std::system_category(), "fgetpwent_r");
+        }
+    }
 }
 
 static int ChildProcess(void *param_ptr)
@@ -277,11 +284,13 @@ static int ChildProcess(void *param_ptr)
         catch (...)
         {
             assert(false);
+            throw;
         }
     }
     catch (...)
     {
         assert(false);
+        throw;
     }
 }
 
@@ -302,16 +311,16 @@ void *StartSandbox(const SandboxParameter &parameter,
                                      CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | SIGCHLD,
                                      const_cast<void *>(reinterpret_cast<const void *>(execParam.get()))));
 
-        CgroupInfo memInfo("memory", parameter.cgroupName),
-            cpuInfo("cpuacct", parameter.cgroupName),
-            pidInfo("pids", parameter.cgroupName);
+        // cgroup v2 uses a single unified hierarchy; one group for all controllers
+        CgroupInfo cgroup(parameter.cgroupName);
 
-        vector<CgroupInfo *> infos = {&memInfo, &cpuInfo, &pidInfo};
+        vector<CgroupInfo *> infos = {&cgroup};
         for (auto &item : infos)
         {
             CreateGroup(*item);
             KillGroupMembers(*item);
-            WriteGroupProperty(*item, "tasks", container_pid);
+            // cgroup v2 uses cgroup.procs to add a process to the group
+            WriteGroupProperty(*item, "cgroup.procs", container_pid);
         }
 
 #define WRITE_WITH_CHECK(__where, __name, __value)                  \
@@ -326,13 +335,12 @@ void *StartSandbox(const SandboxParameter &parameter,
         }                                                           \
     }
 
-        // Forcibly clear any memory usage by cache.
-        // WriteGroupProperty(memInfo, "memory.force_empty", 0); // This is too slow!!!!
-        WriteGroupProperty(memInfo, "memory.memsw.limit_in_bytes", -1);
-        WriteGroupProperty(memInfo, "memory.limit_in_bytes", -1);
-        WRITE_WITH_CHECK(memInfo, "memory.limit_in_bytes", parameter.memoryLimit);
-        WRITE_WITH_CHECK(memInfo, "memory.memsw.limit_in_bytes", parameter.memoryLimit);
-        WRITE_WITH_CHECK(pidInfo, "pids.max", parameter.processLimit);
+        // cgroup v2 memory controls: memory.max, memory.swap.max
+        WriteGroupProperty(cgroup, "memory.swap.max", -1);
+        WriteGroupProperty(cgroup, "memory.max", -1);
+        WRITE_WITH_CHECK(cgroup, "memory.max", parameter.memoryLimit);
+        WRITE_WITH_CHECK(cgroup, "memory.swap.max", 0);
+        WRITE_WITH_CHECK(cgroup, "pids.max", parameter.processLimit);
 
         // Wait for at most 500ms. If the child process hasn't posted the semaphore,
         // We will assume that the child has already dead.
@@ -358,9 +366,16 @@ void *StartSandbox(const SandboxParameter &parameter,
             throw std::runtime_error((format("The child process has reported the following error: {}", errstr)));
         }
 
-        // Clear usage stats.
-        WriteGroupProperty(memInfo, "memory.memsw.max_usage_in_bytes", 0);
-        WriteGroupProperty(cpuInfo, "cpuacct.usage", 0);
+        // cgroup v2 does not support resetting usage counters in the same way.
+        // Capture baselines just before exec to exclude clone/setup costs.
+        try {
+            auto cpuStat = ReadGroupPropertyMap(cgroup, "cpu.stat");
+            int64_t usage_usec = cpuStat["usage_usec"];
+            execParam->baselineCpuUsageUs = usage_usec; 
+        } catch (...) {
+            execParam->baselineCpuUsageUs = 0;
+        }
+        // TODO: clear memory.peak or save baseline
 
         // Continue the child.
         execParam->semaphore2.Post();
@@ -409,4 +424,13 @@ WaitForProcess(pid_t pid, void *executionParameter)
         result.code = WTERMSIG(status);
     }
     return result;
+}
+
+Baselines GetBaselines(void *executionParameter)
+{
+    std::unique_ptr<ExecutionParameter> &dummy = *reinterpret_cast<std::unique_ptr<ExecutionParameter> *>(&executionParameter);
+    ExecutionParameter *execParam = reinterpret_cast<ExecutionParameter *>(executionParameter);
+    Baselines b{};
+    b.cpuUsageUs = execParam->baselineCpuUsageUs;
+    return b;
 }

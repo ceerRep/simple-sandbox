@@ -17,7 +17,7 @@
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
-#include <fmt/std.h>
+#include <fmt/os.h>
 
 #include "utils.h"
 #include "cgroup.h"
@@ -38,14 +38,10 @@ static bool IsEmpty(const string &str)
     auto f = [](unsigned char const c) { return std::isspace(c); };
     return std::all_of(str.begin(), str.end(), f);
 }
-CgroupInfo::CgroupInfo(const string &controller, const string &group)
-    : Controller(controller), Group(group)
+CgroupInfo::CgroupInfo(const string &group)
+    : Group(group)
 {
-    if (IsEmpty(controller))
-    {
-        throw std::invalid_argument("Controller name cannot be empty!");
-    }
-    else if (IsEmpty(group))
+    if (IsEmpty(group))
     {
         throw std::invalid_argument("Group name cannot be empty!");
     }
@@ -57,18 +53,7 @@ map<string, vector<fs::path>> InitializeCgroup()
     map<string, vector<fs::path>> cgroup_mnt;
 
     char buf[4 * FILENAME_MAX];
-
-    ifstream proc_cgroup("/proc/cgroups");
-    // The first line is ignored.
-    proc_cgroup.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-    vector<string> controllers;
-    string subsys_name;
-    int hierarchy, num_cgroups, enabled;
-    while (proc_cgroup >> subsys_name >> hierarchy >> num_cgroups >> enabled)
-    {
-        controllers.push_back(string(subsys_name));
-    }
+    // cgroup v2 has a single unified hierarchy mounted as type "cgroup2".
 
     std::unique_ptr<FILE, decltype(fclose) *> proc_mount(CHECKNULL(fopen("/proc/mounts", "re")), fclose);
     std::unique_ptr<mntent> temp_ent = std::make_unique<mntent>();
@@ -77,35 +62,30 @@ map<string, vector<fs::path>> InitializeCgroup()
                               buf,
                               sizeof(buf))) != NULL)
     {
-        if (strcmp(ent->mnt_type, "cgroup"))
-            continue;
-
-        for (auto iter = controllers.begin(); iter != controllers.end(); iter++)
+        // Prefer unified cgroup v2
+        if (strcmp(ent->mnt_type, "cgroup2") == 0)
         {
-            char *mntopt = hasmntopt(ent, iter->c_str());
-            if (!mntopt)
-                continue;
-
-            cgroup_mnt[*iter].push_back(fs::path(string(ent->mnt_dir)));
+            cgroup_mnt["unified"].push_back(fs::path(string(ent->mnt_dir)));
         }
     }
 
     return cgroup_mnt;
 }
 
-static const fs::path &GetPath(const string &controller)
+static const fs::path &GetPath()
 {
-    auto mnts = cgroup_mnt.find(controller);
+    // In v2, all controllers reside in the unified mount.
+    auto mnts = cgroup_mnt.find("unified");
     if (mnts == cgroup_mnt.end())
     {
-        throw std::invalid_argument((format("Controller {} does not exist.", controller)));
+        throw std::invalid_argument("cgroup v2 unified mount not found.");
     }
     return (mnts->second)[0];
 }
 
 static fs::path EnsureGroup(const CgroupInfo &info)
 {
-    fs::path groupDirectory = GetPath(info.Controller) / info.Group;
+    fs::path groupDirectory = GetPath() / info.Group;
     if (!fs::exists(groupDirectory) || !fs::is_directory(groupDirectory))
     {
         throw std::runtime_error((format("Path {} is not valid (does not exist or is not a directory).", groupDirectory)));
@@ -149,7 +129,8 @@ static int64_t ReadInt64(const fs::path &path)
 
 void CreateGroup(const CgroupInfo &info)
 {
-    auto groupDirectory = GetPath(info.Controller) / info.Group;
+    auto groupDirectory = GetPath() / info.Group;
+
     if (!fs::exists(groupDirectory))
     {
         fs::create_directories(groupDirectory);
@@ -157,6 +138,18 @@ void CreateGroup(const CgroupInfo &info)
     else if (!fs::is_directory(groupDirectory))
     {
         throw std::runtime_error((format("Path {} has already been used and is not a directory.", groupDirectory)));
+    }
+
+    // Add memory and pid controllers to the group
+    std::filesystem::path cur;
+    for (auto &part : std::filesystem::path(info.Group)) {
+        cur /= part;
+        auto curDir = GetPath() / cur;
+
+        if (curDir == groupDirectory)
+            break;
+        
+        WriteGroupProperty(CgroupInfo(cur.string()), "cgroup.subtree_control", "+memory +pids", false);
     }
 }
 
@@ -194,7 +187,18 @@ map<string, int64_t> ReadGroupPropertyMap(const CgroupInfo &info, const string &
 
 void KillGroupMembers(const CgroupInfo &info)
 {
-    auto v = ReadGroupPropertyArray(info, "tasks");
+    // cgroup v2 supports bulk kill via cgroup.kill
+    auto groupDir = EnsureGroup(info);
+    try
+    {
+        WriteFile(groupDir / "cgroup.kill", 1, true);
+        return;
+    }
+    catch (...)
+    {
+        // Fallback to iterating processes if cgroup.kill not available
+    }
+    auto v = ReadGroupPropertyArray(info, "cgroup.procs");
     for (auto &item : v)
     {
         ENSURE(kill((int)(item), SIGKILL));
@@ -211,7 +215,14 @@ void RemoveCgroup(const CgroupInfo &info)
 void WriteGroupProperty(const CgroupInfo &info, const string &property, int64_t val, bool overwrite)
 {
     auto groupDir = EnsureGroup(info);
-    return WriteFile(groupDir / property, val, overwrite);
+    if (val < 0)
+    {
+        return WriteFile(groupDir / property, string("max"), overwrite);
+    }
+    else
+    {
+        return WriteFile(groupDir / property, val, overwrite);
+    }
 }
 
 void WriteGroupProperty(const CgroupInfo &info, const string &property, const string &val, bool overwrite)

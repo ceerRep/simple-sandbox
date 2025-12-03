@@ -103,3 +103,9 @@ void GetUserEntryInSandbox(const std::filesystem::path &rootfs, const std::strin
 void *StartSandbox(const SandboxParameter &, pid_t &);
 
 ExecutionResult WaitForProcess(pid_t pid, void *executionParameter);
+
+struct Baselines {
+    int64_t cpuUsageUs;
+};
+
+Baselines GetBaselines(void *executionParameter);

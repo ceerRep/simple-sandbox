@@ -23,13 +23,13 @@ Napi::Value NodeGetCgroupProperty2(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    string controllerName = GetStringWithEmptyCheck(info[0]);
-    string cgroupName = GetStringWithEmptyCheck(info[1]);
-    string propertyName = GetStringWithEmptyCheck(info[2]);
-    string subPropertyName = GetStringWithEmptyCheck(info[3]);
+    string cgroupName = GetStringWithEmptyCheck(info[0]);
+    string propertyName = GetStringWithEmptyCheck(info[1]);
+    string subPropertyName = GetStringWithEmptyCheck(info[2]);
     try
     {
-        CgroupInfo cginfo(controllerName, cgroupName);
+        // cgroup v2 unified: ignore controller; use group only
+        CgroupInfo cginfo(cgroupName);
         // v8 doesn't support 64-bit integer, so let's use string.
         return Napi::String::New(env, std::to_string(ReadGroupPropertyMap(cginfo, propertyName)[subPropertyName]));
     }
@@ -48,12 +48,11 @@ Napi::Value NodeGetCgroupProperty(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    string controllerName = GetStringWithEmptyCheck(info[0]);
-    string cgroupName = GetStringWithEmptyCheck(info[1]);
-    string propertyName = GetStringWithEmptyCheck(info[2]);
+    string cgroupName = GetStringWithEmptyCheck(info[0]);
+    string propertyName = GetStringWithEmptyCheck(info[1]);
     try
     {
-        CgroupInfo cginfo(controllerName, cgroupName);
+        CgroupInfo cginfo(cgroupName);
         // v8 doesn't support 64-bit integer, so let's use string.
         return Napi::String::New(env, std::to_string(ReadGroupProperty(cginfo, propertyName)));
     }
@@ -72,11 +71,10 @@ void NodeRemoveCgroup(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
 
-    string controllerName = GetStringWithEmptyCheck(info[0]);
-    string cgroupName = GetStringWithEmptyCheck(info[1]);
+    string cgroupName = GetStringWithEmptyCheck(info[0]);
     try
     {
-        CgroupInfo cginfo(controllerName, cgroupName);
+        CgroupInfo cginfo(cgroupName);
         RemoveCgroup(cginfo);
     }
     catch (std::exception &ex)
@@ -265,6 +263,15 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getUidAndGidInSandbox", Napi::Function::New(env, NodeGetUidAndGidInSandbox));
     exports.Set("startSandbox", Napi::Function::New(env, NodeStartSandbox));
     exports.Set("waitForProcess", Napi::Function::New(env, NodeWaitForProcess));
+    // Return baselines captured before execvpe: { cpuUsageUs }
+    exports.Set("getCgroupBaselines", Napi::Function::New(env, [](const Napi::CallbackInfo &info) {
+        Napi::Env env = info.Env();
+        void *executionParameter = *reinterpret_cast<void **>(info[0].As<Napi::ArrayBuffer>().Data());
+        Baselines b = GetBaselines(executionParameter);
+        Napi::Object obj = Napi::Object::New(env);
+        obj.Set("cpuUsageUs", Napi::Number::New(env, static_cast<double>(b.cpuUsageUs)));
+        return obj;
+    }));
     return exports;
 }
 

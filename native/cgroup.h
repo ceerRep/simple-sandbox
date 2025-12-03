@@ -6,12 +6,13 @@
 #include <string>
 #include <list>
 #include <map>
+#include <vector>
+#include <filesystem>
 
 struct CgroupInfo
 {
-    std::string Controller;
     std::string Group;
-    CgroupInfo(const std::string &controller, const std::string &group); // : Controller(controller), Group(group)
+    explicit CgroupInfo(const std::string &group);
 };
 
 // Look for controllers and their mount paths.

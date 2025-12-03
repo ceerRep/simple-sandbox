@@ -7,8 +7,9 @@ import * as path from 'path';
 
 export * from './interfaces';
 
-if (!existsSync('/sys/fs/cgroup/memory/memory.memsw.usage_in_bytes')) {
-    throw new Error("Your linux kernel doesn't support memory-swap account. Please turn it on following the readme.");
+// Require cgroup v2 unified hierarchy
+if (!existsSync('/sys/fs/cgroup/cgroup.controllers')) {
+    throw new Error("Cgroup v2 unified hierarchy is required.");
 }
 
 const MAX_RETRY_TIMES = 20;

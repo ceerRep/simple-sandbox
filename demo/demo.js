@@ -1,5 +1,6 @@
 const sss = require('../lib'),
-    rl = require('readline');
+    rl = require('readline'),
+    path = require('path');
 
 const terminationHandler = () => {
     process.exit(1);
@@ -8,7 +9,10 @@ const terminationHandler = () => {
 process.on('SIGTERM', terminationHandler);
 process.on('SIGINT', terminationHandler);
 
-const doThings = async () => {
+const parentDir = path.dirname(__dirname);
+const buildPath = path.join(parentDir, 'build');
+
+const runProgram = async (time_sec, memory_pages) => {
     try {
         const rootfs = "/opt/sandbox-test/rootfs"
         const sandboxedProcess = sss.startSandbox({
@@ -16,7 +20,7 @@ const doThings = async () => {
             chroot: rootfs,
             mounts: [
                 {
-                    src: "/opt/sandbox-test/binary",
+                    src: buildPath,
                     dst: "/sandbox/binary",
                     limit: 0
                 }, {
@@ -24,18 +28,18 @@ const doThings = async () => {
                     dst: "/sandbox/working",
                     limit: 10240 * 1024
                 }],
-            executable: "/bin/bash",
-            parameters: ["/bin/bash"],
+            executable: "/sandbox/binary/busy",
+            parameters: ["/sandbox/binary/busy", time_sec.toString(), memory_pages.toString()],
             environments: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
             stdin: "/dev/stdin",
             stdout: "/dev/stdout",
             stderr: "/dev/stdout",
-            time: 60 * 1000, // 1 minute, for a bash playground
+            time: 2 * 1000, 
             mountProc: true,
             redirectBeforeChroot: true,
             memory: 102400 * 1024, // 100MB
             process: 30,
-            user: sss.getUidAndGidInSandbox(rootfs, "sandbox"),
+            user: sss.getUidAndGidInSandbox(rootfs, "nobody"),
             cgroup: "asdf",
             workingDirectory: "/sandbox/working"
         });
@@ -49,10 +53,23 @@ const doThings = async () => {
         // });
 
         const result = await sandboxedProcess.waitForStop();
-        console.log("Your sandbox finished!" + JSON.stringify(result));
+        return result;
     } catch (ex) {
         console.log("Whooops! " + ex.toString());
     }
     process.exit();
 };
-doThings();
+
+const testSandbox = async () => {
+    // Normal
+    const result_ok = await runProgram(1, Math.floor(50 * 1024 / 4)); // 1s, 50MiB
+    console.log("Normal sandbox finished!" + JSON.stringify(result_ok));
+    // TLE
+    const result_tle = await runProgram(3, Math.floor(50 * 1024 / 4)); // 2s, 50MiB
+    console.log("TLE sandbox finished!" + JSON.stringify(result_tle));
+    // MLE
+    const result_mle = await runProgram(1, Math.floor(200 * 1024 / 4)); // 1s, 200MiB
+    console.log("MLE sandbox finished!" + JSON.stringify(result_mle));
+}
+
+testSandbox();

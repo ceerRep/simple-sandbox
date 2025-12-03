@@ -6,8 +6,9 @@ export class SandboxProcess {
     private readonly cancellationToken: NodeJS.Timer = null;
     private readonly stopCallback: () => void;
 
-    private countedCpuTime: number = 0;
-    private actualCpuTime: number = 0;
+    private countedCpuTime: number = 0; // accumulated, in ns
+    private actualCpuTime: number = 0;  // last observed, in ns
+    private baselinecpuUsageUs: number = 0; // initial cpu usage (ns)
     private timeout: boolean = false;
     private cancelled: boolean = false;
     private waitPromise: Promise<SandboxResult> = null;
@@ -25,6 +26,8 @@ export class SandboxProcess {
             myFather.stop();
         }
 
+        this.baselinecpuUsageUs = 0;
+
         let checkIfTimedOut = () => { };
         if (this.parameter.time !== -1) {
             // Check every 50ms.
@@ -34,9 +37,12 @@ export class SandboxProcess {
                 let current = new Date().getTime();
                 const spent = current - lastCheck;
                 lastCheck = current;
-                const val: number = Number(sandboxAddon.getCgroupProperty("cpuacct", myFather.parameter.cgroup, "cpuacct.usage"));
+                // cgroup v2: cpu.stat usage_usec
+                myFather.updateBaseline(execParam);
+                const cpuUsec: number = Number(sandboxAddon.getCgroupProperty2(myFather.parameter.cgroup, "cpu.stat", "usage_usec")) - myFather.baselinecpuUsageUs;
+                const val: number = cpuUsec; // us
                 myFather.countedCpuTime += Math.max(
-                    val - myFather.actualCpuTime,  // The real time, or if less than 40%,
+                    (val - myFather.actualCpuTime) * 1000, // ns  
                     utils.milliToNano(spent) * 0.4 // 40% of actually elapsed time
                 );
                 myFather.actualCpuTime = val;
@@ -62,11 +68,11 @@ export class SandboxProcess {
                     rej(err);    
                 } else {
                     try {
-                        const memUsageWithCache: number = Number(sandboxAddon.getCgroupProperty("memory", myFather.parameter.cgroup, "memory.memsw.max_usage_in_bytes"));
-                        const cache: number = Number(sandboxAddon.getCgroupProperty2("memory", myFather.parameter.cgroup, "memory.stat", "cache"));
-                        const memUsage = memUsageWithCache - cache;
-    
-                        myFather.actualCpuTime = Number(sandboxAddon.getCgroupProperty("cpuacct", myFather.parameter.cgroup, "cpuacct.usage"));
+                        // cgroup v2: memory.peak and cpu.stat usage_usec; compute deltas from baseline
+                        const memUsage: number = Number(sandboxAddon.getCgroupProperty(myFather.parameter.cgroup, "memory.peak"));
+
+                        const cpuUsecEnd: number = Number(sandboxAddon.getCgroupProperty2(myFather.parameter.cgroup, "cpu.stat", "usage_usec"));
+                        myFather.actualCpuTime = (cpuUsecEnd - myFather.baselinecpuUsageUs) * 1000;
                         myFather.cleanup();
     
                         const result: SandboxResult = {
@@ -97,10 +103,14 @@ export class SandboxProcess {
         });
     }
 
+    private updateBaseline(execParam: ArrayBuffer): void {
+        const b = sandboxAddon.getCgroupBaselines(execParam);
+        this.baselinecpuUsageUs = Number(b.cpuUsageUs) || 0;
+    }
+
     private removeCgroup(): void {
-        sandboxAddon.removeCgroup("memory", this.parameter.cgroup);
-        sandboxAddon.removeCgroup("cpuacct", this.parameter.cgroup);
-        sandboxAddon.removeCgroup("pids", this.parameter.cgroup);
+        // cgroup v2 unified removal
+        sandboxAddon.removeCgroup(this.parameter.cgroup);
     }
 
     private cleanup(): void {

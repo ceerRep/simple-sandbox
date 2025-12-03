@@ -65,6 +65,7 @@ typings/
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
+.cache/*
 
 ### Vim ###
 # swap

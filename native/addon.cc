@@ -256,6 +256,22 @@ Napi::Value NodeGetUidAndGidInSandbox(const Napi::CallbackInfo &info)
     return result;
 }
 
+Napi::Value NodeUnixPipe(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        Napi::Error::New(env, "Failed to create pipe: " + string(strerror(errno))).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("read", Napi::Number::New(env, pipefd[0]));
+    result.Set("write", Napi::Number::New(env, pipefd[1]));
+    return result;
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getCgroupProperty", Napi::Function::New(env, NodeGetCgroupProperty));
     exports.Set("getCgroupProperty2", Napi::Function::New(env, NodeGetCgroupProperty2));
@@ -272,6 +288,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         obj.Set("cpuUsageUs", Napi::Number::New(env, static_cast<double>(b.cpuUsageUs)));
         return obj;
     }));
+    exports.Set("unixPipe", Napi::Function::New(env, NodeUnixPipe));
     return exports;
 }
 

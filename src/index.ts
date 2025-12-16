@@ -44,3 +44,11 @@ export function getUidAndGidInSandbox(rootfs: string, username: string): { uid: 
         throw e;
     }
 }
+
+export function pipe(): { read: number; write: number } {
+    try {
+        return nativeAddon.unixPipe();
+    } catch (e) {
+        throw e;
+    }
+}

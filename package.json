@@ -28,8 +28,9 @@
   "scripts": {
     "install": "cmake-js compile",
     "build": "tsc -p ./src",
+    "prepare": "npm run build",
     "build:watch": "tsc -w -p ./src",
-    "prepublishOnly": "yarn build"
+    "prepublishOnly": "npm run build"
   },
   "files": [
     "CMakeLists.txt",

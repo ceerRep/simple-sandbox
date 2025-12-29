@@ -1,5 +1,4 @@
 #include <string>
-#include <vector>
 #include <list>
 #include <algorithm>
 #include <map>
@@ -23,7 +22,6 @@
 #include "cgroup.h"
 
 using std::string;
-using std::vector;
 using std::list;
 using std::map;
 using std::ifstream;
@@ -31,7 +29,7 @@ using std::ofstream;
 namespace fs = std::filesystem;
 using fmt::format;
 
-const map<string, vector<fs::path>> cgroup_mnt = InitializeCgroup();
+const std::optional<std::filesystem::path> cgroup_mnt = InitializeCgroup();
 
 static bool IsEmpty(const string &str)
 {
@@ -48,12 +46,10 @@ CgroupInfo::CgroupInfo(const string &group)
 }
 
 // This piece of code is copied from libcgroup but translated to C++. C++ is very great.
-map<string, vector<fs::path>> InitializeCgroup()
+std::optional<std::filesystem::path> InitializeCgroup()
 {
-    map<string, vector<fs::path>> cgroup_mnt;
-
     char buf[4 * FILENAME_MAX];
-    // cgroup v2 has a single unified hierarchy mounted as type "cgroup2".
+    // cgroup v2 has a single hierarchy mounted as type "cgroup2".
 
     std::unique_ptr<FILE, decltype(fclose) *> proc_mount(CHECKNULL(fopen("/proc/mounts", "re")), fclose);
     std::unique_ptr<mntent> temp_ent = std::make_unique<mntent>();
@@ -62,25 +58,22 @@ map<string, vector<fs::path>> InitializeCgroup()
                               buf,
                               sizeof(buf))) != NULL)
     {
-        // Prefer unified cgroup v2
         if (strcmp(ent->mnt_type, "cgroup2") == 0)
         {
-            cgroup_mnt["unified"].push_back(fs::path(string(ent->mnt_dir)));
+            return fs::path(string(ent->mnt_dir));
         }
     }
 
-    return cgroup_mnt;
+    return std::nullopt;
 }
 
 static const fs::path &GetPath()
 {
-    // In v2, all controllers reside in the unified mount.
-    auto mnts = cgroup_mnt.find("unified");
-    if (mnts == cgroup_mnt.end())
+    if (cgroup_mnt == std::nullopt)
     {
-        throw std::invalid_argument("cgroup v2 unified mount not found.");
+        throw std::invalid_argument("cgroup v2 mount not found.");
     }
-    return (mnts->second)[0];
+    return *cgroup_mnt;
 }
 
 static fs::path EnsureGroup(const CgroupInfo &info)
@@ -141,6 +134,9 @@ void CreateGroup(const CgroupInfo &info)
     }
 
     // Add memory and pid controllers to the group
+
+    WriteGroupProperty(CgroupInfo(GetPath().string()), "cgroup.subtree_control", "+memory +pids", false);
+
     std::filesystem::path cur;
     for (auto &part : std::filesystem::path(info.Group)) {
         cur /= part;

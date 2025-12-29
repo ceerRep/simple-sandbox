@@ -6,7 +6,7 @@
 #include <string>
 #include <list>
 #include <map>
-#include <vector>
+#include <optional>
 #include <filesystem>
 
 struct CgroupInfo
@@ -15,8 +15,8 @@ struct CgroupInfo
     explicit CgroupInfo(const std::string &group);
 };
 
-// Look for controllers and their mount paths.
-std::map<std::string, std::vector<std::filesystem::path>> InitializeCgroup();
+// Look for mount paths.
+std::optional<std::filesystem::path> InitializeCgroup();
 
 void CreateGroup(const CgroupInfo &info);
 

@@ -10,81 +10,12 @@
 #include <fmt/format.h>
 
 #include "sandbox.h"
-#include "cgroup.h"
 
 using std::string;
 namespace fs = std::filesystem;
 
 std::string GetStringWithEmptyCheck(Napi::Value value) {
     return value.IsString() ? value.ToString().Utf8Value() : "";
-}
-
-Napi::Value NodeGetCgroupProperty2(const Napi::CallbackInfo &info)
-{
-    Napi::Env env = info.Env();
-
-    string cgroupName = GetStringWithEmptyCheck(info[0]);
-    string propertyName = GetStringWithEmptyCheck(info[1]);
-    string subPropertyName = GetStringWithEmptyCheck(info[2]);
-    try
-    {
-        // cgroup v2 unified: ignore controller; use group only
-        CgroupInfo cginfo(cgroupName);
-        // v8 doesn't support 64-bit integer, so let's use string.
-        return Napi::String::New(env, std::to_string(ReadGroupPropertyMap(cginfo, propertyName)[subPropertyName]));
-    }
-    catch (std::exception &ex)
-    {
-        Napi::Error::New(env, ex.what()).ThrowAsJavaScriptException();
-    }
-    catch (...)
-    {
-        Napi::Error::New(env, "Something unexpected happened while getting cgroup property.").ThrowAsJavaScriptException();
-    }
-    return Napi::Value();
-}
-
-Napi::Value NodeGetCgroupProperty(const Napi::CallbackInfo &info)
-{
-    Napi::Env env = info.Env();
-
-    string cgroupName = GetStringWithEmptyCheck(info[0]);
-    string propertyName = GetStringWithEmptyCheck(info[1]);
-    try
-    {
-        CgroupInfo cginfo(cgroupName);
-        // v8 doesn't support 64-bit integer, so let's use string.
-        return Napi::String::New(env, std::to_string(ReadGroupProperty(cginfo, propertyName)));
-    }
-    catch (std::exception &ex)
-    {
-        Napi::Error::New(env, ex.what()).ThrowAsJavaScriptException();
-    }
-    catch (...)
-    {
-        Napi::Error::New(env, "Something unexpected happened while getting cgroup property.").ThrowAsJavaScriptException();
-    }
-    return Napi::Value();
-}
-
-void NodeRemoveCgroup(const Napi::CallbackInfo &info)
-{
-    Napi::Env env = info.Env();
-
-    string cgroupName = GetStringWithEmptyCheck(info[0]);
-    try
-    {
-        CgroupInfo cginfo(cgroupName);
-        RemoveCgroup(cginfo);
-    }
-    catch (std::exception &ex)
-    {
-        Napi::Error::New(env, ex.what()).ThrowAsJavaScriptException();
-    }
-    catch (...)
-    {
-        Napi::Error::New(env, "Something unexpected happened while removing cgroup.").ThrowAsJavaScriptException();
-    }
 }
 
 std::vector<string> StringArrayToVector(const Napi::Array &array) {
@@ -101,6 +32,7 @@ std::vector<int> IntArrayToVector(const Napi::Array &array) {
 
 Napi::Value NodeStartSandbox(const Napi::CallbackInfo &info)
 {
+    fmt::print("Starting sandbox\n");
     Napi::Env env = info.Env();
 
     SandboxParameter param;
@@ -146,6 +78,8 @@ Napi::Value NodeStartSandbox(const Napi::CallbackInfo &info)
         param.stackSize = -2;
     }
 
+    fmt::print("Stack size: {}\n", param.stackSize);
+
     param.executableParameters = StringArrayToVector(jsparam.Get("parameters").As<Napi::Array>());
     param.environmentVariables = StringArrayToVector(jsparam.Get("environments").As<Napi::Array>());
     Napi::Array mounts = jsparam.Get("mounts").As<Napi::Array>();
@@ -162,6 +96,7 @@ Napi::Value NodeStartSandbox(const Napi::CallbackInfo &info)
     try
     {
         pid_t pid;
+        fmt::print("Starting sandbox\n");
         void *execParam = StartSandbox(param, pid);
         Napi::Object result = Napi::Object::New(env);
         result.Set("pid", Napi::Number::New(env, pid));
@@ -186,7 +121,7 @@ class WaitForProcessWorker : public Napi::AsyncWorker
 private:
     pid_t pid;
     void *executionParameter;
-    ExecutionResult result;
+    ExecutionResult result{}; // timeNs, memoryBytes set by WaitForProcess
 
 public:
     WaitForProcessWorker(Napi::Function &callback, pid_t pid, void *executionParameter)
@@ -216,6 +151,8 @@ public:
 
         obj.Set("status", result.status == EXITED ? "exited" : "signaled");
         obj.Set("code", result.code);
+        obj.Set("time", Napi::Number::New(env, static_cast<double>(result.timeNs)));
+        obj.Set("memory", Napi::Number::New(env, static_cast<double>(result.memoryBytes)));
 
         Callback().Call({env.Undefined(), obj});
     }
@@ -272,22 +209,25 @@ Napi::Value NodeUnixPipe(const Napi::CallbackInfo &info)
     return result;
 }
 
+void NodeKillProcessGroup(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+    pid_t pgid = info[0].ToNumber().Int32Value();
+    try
+    {
+        KillProcessGroup(pgid);
+    }
+    catch (std::exception &ex)
+    {
+        Napi::Error::New(env, ex.what()).ThrowAsJavaScriptException();
+    }
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    exports.Set("getCgroupProperty", Napi::Function::New(env, NodeGetCgroupProperty));
-    exports.Set("getCgroupProperty2", Napi::Function::New(env, NodeGetCgroupProperty2));
-    exports.Set("removeCgroup", Napi::Function::New(env, NodeRemoveCgroup));
     exports.Set("getUidAndGidInSandbox", Napi::Function::New(env, NodeGetUidAndGidInSandbox));
     exports.Set("startSandbox", Napi::Function::New(env, NodeStartSandbox));
     exports.Set("waitForProcess", Napi::Function::New(env, NodeWaitForProcess));
-    // Return baselines captured before execvpe: { cpuUsageUs }
-    exports.Set("getCgroupBaselines", Napi::Function::New(env, [](const Napi::CallbackInfo &info) {
-        Napi::Env env = info.Env();
-        void *executionParameter = *reinterpret_cast<void **>(info[0].As<Napi::ArrayBuffer>().Data());
-        Baselines b = GetBaselines(executionParameter);
-        Napi::Object obj = Napi::Object::New(env);
-        obj.Set("cpuUsageUs", Napi::Number::New(env, static_cast<double>(b.cpuUsageUs)));
-        return obj;
-    }));
+    exports.Set("killProcessGroup", Napi::Function::New(env, NodeKillProcessGroup));
     exports.Set("unixPipe", Napi::Function::New(env, NodeUnixPipe));
     return exports;
 }

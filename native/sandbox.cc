@@ -20,7 +20,11 @@
 #include <sys/resource.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
-#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <cerrno>
+
+#include <seccomp.h>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -28,7 +32,6 @@
 
 #include "sandbox.h"
 #include "utils.h"
-#include "cgroup.h"
 #include "semaphore.h"
 #include "pipe.h"
 
@@ -116,9 +119,6 @@ struct ExecutionParameter
     // This pipe is used to forward error message from the child process to the parent.
     PosixPipe pipefd;
 
-    // Baseline stats captured just before exec
-    int64_t baselineCpuUsageUs = 0;
-
     ExecutionParameter(const SandboxParameter &param, int pipeOptions) : parameter(param),
                                                                          semaphore1(true, 0),
                                                                          semaphore2(true, 0),
@@ -126,6 +126,41 @@ struct ExecutionParameter
     {
     }
 };
+
+// Install seccomp filter via libseccomp: deny setsid, setpgid; deny socket/socketpair
+// only for AF_INET/AF_INET6 (setpgrp covered by setpgid; AF_UNIX allowed for runtime/NSS).
+// libseccomp sets PR_SET_NO_NEW_PRIVS and handles arch/nr offsets. Installed after setuid;
+// if seccomp_load fails with EPERM (e.g. LSM), consider moving before setuid, after chroot.
+static void InstallSeccompFilter()
+{
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+    if (ctx == nullptr)
+        throw std::runtime_error("seccomp_init failed");
+
+    auto release_ctx = [](scmp_filter_ctx *p) {
+        if (p)
+            seccomp_release(*p);
+    };
+    std::unique_ptr<scmp_filter_ctx, decltype(release_ctx)> ctx_guard(&ctx, release_ctx);
+
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(setsid), 0));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(setpgid), 0));
+
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_INET)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_INET6)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socketpair), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_INET)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socketpair), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_INET6)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(clone), 1,
+                                   SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_PARENT, CLONE_PARENT)));
+
+    Ensure_Seccomp(seccomp_load(ctx));
+    // ctx_guard frees ctx on return
+}
 
 static void EnsureDirectoryExistance(fs::path dir) {
     if (!fs::exists(dir))
@@ -189,48 +224,30 @@ static int ChildProcess(void *param_ptr)
             RedirectIO(parameter, nullfd);
         }
 
-        ENSURE(mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)); // Make root private
-
-        EnsureDirectoryExistance(parameter.chrootDirectory);
-        ENSURE(mount(parameter.chrootDirectory.string().c_str(),
-                     parameter.chrootDirectory.string().c_str(), "", MS_BIND | MS_RDONLY | MS_REC, ""));
-        ENSURE(mount("", parameter.chrootDirectory.string().c_str(), "", MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC, ""));
-
         for (MountInfo &info : parameter.mounts)
         {
             if (!info.dst.is_absolute()) {
                 throw std::invalid_argument(format("The dst path {} in mounts should be absolute.", info.dst));
             }
 
-            fs::path target = parameter.chrootDirectory / std::filesystem::relative(info.dst, "/");
+            fs::path target = parameter.chrootDirectory / info.dst;
+            fmt::print("Symlinking {} to {}\n", info.src, target);
 	    
             EnsureDirectoryExistance(info.src);
-            EnsureDirectoryExistance(target);
-            ENSURE(mount(info.src.string().c_str(), target.string().c_str(), "", MS_BIND | MS_REC, ""));
-            if (info.limit == 0)
-            {
-                ENSURE(mount("", target.string().c_str(), "", MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC, ""));
-            }
-            else if (info.limit != -1)
-            {
-                // TODO: implement.
-            }
+
+            // In a normal container, cannot do bind mount
+            // Use symlink to achieve the same effect.
+            std::error_code ec;
+            fs::remove(target, ec);
+            ENSURE(symlink(info.src.string().c_str(), target.string().c_str()));
         }
 
-        ENSURE(chroot(parameter.chrootDirectory.string().c_str()));
+        // ENSURE(chroot(parameter.chrootDirectory.string().c_str()));
         ENSURE(chdir(parameter.workingDirectory.string().c_str()));
 
-        if (parameter.mountProc)
-        {
-            ENSURE(mount("proc", "/proc", "proc", 0, NULL));
-        }
         if (!parameter.redirectBeforeChroot)
         {
             RedirectIO(parameter, nullfd);
-        }
-
-        if (!parameter.hostname.empty()) {
-            ENSURE(sethostname(parameter.hostname.c_str(), parameter.hostname.length()));
         }
 
         if (parameter.stackSize != -2)
@@ -252,6 +269,21 @@ static int ChildProcess(void *param_ptr)
         ENSURE(syscall(SYS_setgroups, 1, groupList));
         ENSURE(syscall(SYS_setuid, parameter.uid));
 
+        // Limit number of processes (RLIMIT_NPROC is per real UID, so set after setuid).
+        // processLimit = max children; total processes = 1 (self) + children, so set limit to processLimit + 1.
+        if (parameter.processLimit != -1)
+        {
+            rlimit rlim;
+            rlim.rlim_cur = rlim.rlim_max = static_cast<rlim_t>(parameter.processLimit);
+            ENSURE(setrlimit(RLIMIT_NPROC, &rlim));
+        }
+
+        // Create new process group so we can kill the whole group later (leader = this process).
+        ENSURE(setpgid(0, 0));
+
+        // Forbid setsid/setpgid/setpgrp to prevent escape from process group.
+        InstallSeccompFilter();
+
         vector<char *> params = StringToPtr(parameter.executableParameters),
                        envi = StringToPtr(parameter.environmentVariables);
 
@@ -271,6 +303,7 @@ static int ChildProcess(void *param_ptr)
     }
     catch (std::exception &err)
     {
+        fmt::print("Exception: {}\n", err.what());
         const char *errMessage = err.what();
         int len = strlen(errMessage);
         try
@@ -307,40 +340,11 @@ void *StartSandbox(const SandboxParameter &parameter,
 
         std::unique_ptr<ExecutionParameter> execParam = std::make_unique<ExecutionParameter>(parameter, O_CLOEXEC | O_NONBLOCK);
 
-        container_pid = ENSURE(clone(ChildProcess, &*childStack.end(),
-                                     CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | SIGCHLD,
+        // Subreaper so we reap all descendants when the direct child exits.
+        ENSURE(prctl(PR_SET_CHILD_SUBREAPER, 1));
+
+        container_pid = ENSURE(clone(ChildProcess, childStack.data() + childStack.size(), SIGCHLD,
                                      const_cast<void *>(reinterpret_cast<const void *>(execParam.get()))));
-
-        // cgroup v2 uses a single unified hierarchy; one group for all controllers
-        CgroupInfo cgroup(parameter.cgroupName);
-
-        vector<CgroupInfo *> infos = {&cgroup};
-        for (auto &item : infos)
-        {
-            CreateGroup(*item);
-            KillGroupMembers(*item);
-            // cgroup v2 uses cgroup.procs to add a process to the group
-            WriteGroupProperty(*item, "cgroup.procs", container_pid);
-        }
-
-#define WRITE_WITH_CHECK(__where, __name, __value)                  \
-    {                                                               \
-        if ((__value) >= 0)                                         \
-        {                                                           \
-            WriteGroupProperty((__where), (__name), (__value));     \
-        }                                                           \
-        else                                                        \
-        {                                                           \
-            WriteGroupProperty((__where), (__name), string("max")); \
-        }                                                           \
-    }
-
-        // cgroup v2 memory controls: memory.max, memory.swap.max
-        WriteGroupProperty(cgroup, "memory.swap.max", -1);
-        WriteGroupProperty(cgroup, "memory.max", -1);
-        WRITE_WITH_CHECK(cgroup, "memory.max", parameter.memoryLimit);
-        WRITE_WITH_CHECK(cgroup, "memory.swap.max", 0);
-        WRITE_WITH_CHECK(cgroup, "pids.max", parameter.processLimit);
 
         // Wait for at most 500ms. If the child process hasn't posted the semaphore,
         // We will assume that the child has already dead.
@@ -366,17 +370,6 @@ void *StartSandbox(const SandboxParameter &parameter,
             throw std::runtime_error((format("The child process has reported the following error: {}", errstr)));
         }
 
-        // cgroup v2 does not support resetting usage counters in the same way.
-        // Capture baselines just before exec to exclude clone/setup costs.
-        try {
-            auto cpuStat = ReadGroupPropertyMap(cgroup, "cpu.stat");
-            int64_t usage_usec = cpuStat["usage_usec"];
-            execParam->baselineCpuUsageUs = usage_usec; 
-        } catch (...) {
-            execParam->baselineCpuUsageUs = 0;
-        }
-        // TODO: clear memory.peak or save baseline
-
         // Continue the child.
         execParam->semaphore2.Post();
 
@@ -399,38 +392,56 @@ WaitForProcess(pid_t pid, void *executionParameter)
 {
     std::unique_ptr<ExecutionParameter> execParam(reinterpret_cast<ExecutionParameter *>(executionParameter));
 
-    ExecutionResult result;
+    ExecutionResult result{};
+    result.timeNs = 0;
+    result.memoryBytes = 0;
+
     int status;
-    ENSURE(waitpid(pid, &status, 0));
+    int mainStatus;
+    struct rusage ru;
+    int64_t maxRssKb = 0;
 
-    // Try reading error message first
-    int errLen, bytesRead = read(execParam->pipefd[0], &errLen, sizeof(int));
-    if (bytesRead > 0)
+    // Wait for the direct child (sandbox leader) first.
+    ENSURE(wait4(pid, &mainStatus, 0, &ru));
+
+    result.timeNs += static_cast<int64_t>(ru.ru_utime.tv_sec) * 1000000000LL
+                   + static_cast<int64_t>(ru.ru_utime.tv_usec) * 1000LL
+                   + static_cast<int64_t>(ru.ru_stime.tv_sec) * 1000000000LL
+                   + static_cast<int64_t>(ru.ru_stime.tv_usec) * 1000LL;
+    if (static_cast<int64_t>(ru.ru_maxrss) > maxRssKb)
+        maxRssKb = ru.ru_maxrss;
+
+    // Reap all descendants (reparented to us via PR_SET_CHILD_SUBREAPER). Block until ECHILD.
+    pid_t w;
+    while ((w = wait4(-1, &status, 0, &ru)) > 0)
     {
-        vector<char> buf(errLen);
-        ENSURE(read(execParam->pipefd[0], &*buf.begin(), errLen));
-        string errstr(buf.begin(), buf.end());
-        throw std::runtime_error((format("The child process has reported the following error: {}", errstr)));
+        result.timeNs += static_cast<int64_t>(ru.ru_utime.tv_sec) * 1000000000LL
+                       + static_cast<int64_t>(ru.ru_utime.tv_usec) * 1000LL
+                       + static_cast<int64_t>(ru.ru_stime.tv_sec) * 1000000000LL
+                       + static_cast<int64_t>(ru.ru_stime.tv_usec) * 1000LL;
+        if (static_cast<int64_t>(ru.ru_maxrss) > maxRssKb)
+            maxRssKb = ru.ru_maxrss;
     }
+    // w == -1 with errno ECHILD means no more children; other errno is unexpected.
+    if (w == -1 && errno != ECHILD)
+        throw std::system_error(errno, std::system_category(), "wait4");
 
-    if (WIFEXITED(status))
+    result.memoryBytes = maxRssKb * 1024;
+
+    if (WIFEXITED(mainStatus))
     {
         result.status = EXITED;
-        result.code = WEXITSTATUS(status);
+        result.code = WEXITSTATUS(mainStatus);
     }
-    else if (WIFSIGNALED(status))
+    else if (WIFSIGNALED(mainStatus))
     {
         result.status = SIGNALED;
-        result.code = WTERMSIG(status);
+        result.code = WTERMSIG(mainStatus);
     }
     return result;
 }
 
-Baselines GetBaselines(void *executionParameter)
+void KillProcessGroup(pid_t pgid)
 {
-    std::unique_ptr<ExecutionParameter> &dummy = *reinterpret_cast<std::unique_ptr<ExecutionParameter> *>(&executionParameter);
-    ExecutionParameter *execParam = reinterpret_cast<ExecutionParameter *>(executionParameter);
-    Baselines b{};
-    b.cpuUsageUs = execParam->baselineCpuUsageUs;
-    return b;
+    (void)kill(-pgid, SIGKILL);
 }

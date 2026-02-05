@@ -16,6 +16,10 @@ struct ExecutionResult
     int status;
     // If exited, this is the exit code; if signaled, this is the signal number.
     int code;
+    // Total CPU time (user + system) in nanoseconds, summed over all reaped children.
+    int64_t timeNs;
+    // Peak memory: max of ru_maxrss over all reaped descendant processes (single-process peak, in KB then converted to bytes).
+    int64_t memoryBytes;
 };
 
 struct MountInfo
@@ -104,8 +108,6 @@ void *StartSandbox(const SandboxParameter &, pid_t &);
 
 ExecutionResult WaitForProcess(pid_t pid, void *executionParameter);
 
-struct Baselines {
-    int64_t cpuUsageUs;
-};
-
-Baselines GetBaselines(void *executionParameter);
+// Kill the process group (use -pgid with kill). Call with container_pid: pgid == leader pid
+// (child did setpgid(0,0), so pgid equals the container/leader pid returned by StartSandbox).
+void KillProcessGroup(pid_t pgid);

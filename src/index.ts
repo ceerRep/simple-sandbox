@@ -7,11 +7,6 @@ import * as path from 'path';
 
 export * from './interfaces';
 
-// Require cgroup v2 unified hierarchy
-if (!existsSync('/sys/fs/cgroup/cgroup.controllers')) {
-    throw new Error("Cgroup v2 unified hierarchy is required.");
-}
-
 const MAX_RETRY_TIMES = 20;
 export function startSandbox(parameter: SandboxParameter): SandboxProcess {
     const doStart = () => {

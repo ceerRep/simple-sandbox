@@ -14,22 +14,13 @@ const buildPath = path.join(parentDir, 'build');
 
 const runProgram = async (time_sec, memory_pages) => {
     try {
-        const rootfs = "/opt/sandbox-test/rootfs"
+        const rootfs = "/"
         const sandboxedProcess = sss.startSandbox({
             hostname: "qwq",
             chroot: rootfs,
-            mounts: [
-                {
-                    src: buildPath,
-                    dst: "/sandbox/binary",
-                    limit: 0
-                }, {
-                    src: "/opt/sandbox-test/working",
-                    dst: "/sandbox/working",
-                    limit: 10240 * 1024
-                }],
-            executable: "/sandbox/binary/busy",
-            parameters: ["/sandbox/binary/busy", time_sec.toString(), memory_pages.toString()],
+            mounts: [],
+            executable: `/busy`,
+            parameters: [`/busy`, time_sec.toString(), memory_pages.toString()],
             environments: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
             stdin: "/dev/stdin",
             stdout: "/dev/stdout",
@@ -41,7 +32,7 @@ const runProgram = async (time_sec, memory_pages) => {
             process: 30,
             user: sss.getUidAndGidInSandbox(rootfs, "nobody"),
             cgroup: "asdf",
-            workingDirectory: "/sandbox/working"
+            workingDirectory: '/'
         });
 
         // Uncomment these and change 'stdin: "/dev/stdin"' to "/dev/null" to cancel the sandbox with enter

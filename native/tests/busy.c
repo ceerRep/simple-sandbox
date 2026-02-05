@@ -13,6 +13,9 @@ static inline double now_sec(void) {
 }
 
 int main(int argc, char *argv[]) {
+    printf("Busy wait started\n");
+    fflush(stdout);
+    sleep(1);
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <seconds> <pages>\n", argv[0]);
         fprintf(stderr, "  seconds : busy wait time (e.g. 3.5)\n");
@@ -74,6 +77,9 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    printf("Busy wait finished\n");
+    fflush(stdout);
 
     return 0;
 }

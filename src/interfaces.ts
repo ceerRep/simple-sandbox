@@ -74,9 +74,8 @@ export interface SandboxParameter {
         gid: number;
     };
 
-    // The Control Group (cgroup) name the sandbox will be put inside.
-    // Please specify a unique name to each sandbox (ideally the name of the sandbox).
-    // Currently, do not generate a random name each time, or there will be some junk files in the cgroup.
+    // Process group name for this sandbox (used for identification; a random suffix is appended when starting).
+    // Please specify a unique base path/name for each sandbox.
     cgroup: string;
 
     // The parameters to be passed to the executable.

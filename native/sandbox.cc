@@ -127,8 +127,10 @@ struct ExecutionParameter
     }
 };
 
-// Install seccomp filter via libseccomp: deny setsid, setpgid; deny socket/socketpair
-// only for AF_INET/AF_INET6 (setpgrp covered by setpgid; AF_UNIX allowed for runtime/NSS).
+// Install seccomp filter via libseccomp: deny setsid, setpgid; allow socket/socketpair
+// only for AF_UNIX (needed by runtime/NSS), deny every other family — this blocks
+// AF_INET/AF_INET6 plus exotic families like AF_ALG/AF_NETLINK/AF_PACKET that have
+// historically been used as kernel-attack surface.
 // libseccomp sets PR_SET_NO_NEW_PRIVS and handles arch/nr offsets. Installed after setuid;
 // if seccomp_load fails with EPERM (e.g. LSM), consider moving before setuid, after chroot.
 static void InstallSeccompFilter()
@@ -146,14 +148,15 @@ static void InstallSeccompFilter()
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(setsid), 0));
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(setpgid), 0));
 
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_INET)));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socket), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_INET6)));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socketpair), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_INET)));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(socketpair), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_INET6)));
+    // Allow only AF_UNIX for socket/socketpair; reject all other families with
+    // EAFNOSUPPORT so that programs (e.g. glibc getaddrinfo probing AF_NETLINK)
+    // get a clean error instead of being killed.
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_UNIX)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socket), 0));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketpair), 1,
+                                   SCMP_A0(SCMP_CMP_EQ, AF_UNIX)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socketpair), 0));
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0));
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(clone), 1,
                                    SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_PARENT, CLONE_PARENT)));

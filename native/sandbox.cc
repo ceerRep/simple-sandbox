@@ -151,12 +151,10 @@ static void InstallSeccompFilter()
     // Allow only AF_UNIX for socket/socketpair; reject all other families with
     // EAFNOSUPPORT so that programs (e.g. glibc getaddrinfo probing AF_NETLINK)
     // get a clean error instead of being killed.
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_UNIX)));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socket), 0));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketpair), 1,
-                                   SCMP_A0(SCMP_CMP_EQ, AF_UNIX)));
-    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socketpair), 0));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socket), 1,
+                                   SCMP_A0(SCMP_CMP_NE, AF_UNIX)));
+    Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socketpair), 1,
+                                   SCMP_A0(SCMP_CMP_NE, AF_UNIX)));
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0));
     Ensure_Seccomp(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(clone), 1,
                                    SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_PARENT, CLONE_PARENT)));

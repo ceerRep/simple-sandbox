@@ -26,7 +26,7 @@ export class SandboxProcess {
 
         // Timeout: real time + 0.5s, then kill process group.
         if (this.parameter.time !== -1) {
-            const limitMs = this.parameter.time + 500;
+            const limitMs = this.parameter.time * 1.5 + 3000;
             this.timeoutHandle = setTimeout(() => {
                 myFather.timeout = true;
                 myFather.stop();
